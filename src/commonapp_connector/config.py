@@ -24,6 +24,7 @@ class Settings:
     sftp_known_hosts: str | None = None
     field_map_path: str | None = None
     state_path: str = "./.state/commonapp.json"
+    db_path: str = "./.state/applications.db"
     jsonl_path: str | None = None
     csv_dir: str | None = None
     webhook_url: str | None = None
@@ -47,6 +48,7 @@ class Settings:
             sftp_known_hosts=get("SFTP_KNOWN_HOSTS"),
             field_map_path=get("FIELD_MAP"),
             state_path=get("STATE_PATH", "./.state/commonapp.json"),
+            db_path=get("DB_PATH", "./.state/applications.db"),
             jsonl_path=get("JSONL_PATH"),
             csv_dir=get("CSV_DIR"),
             webhook_url=get("WEBHOOK_URL"),
@@ -66,7 +68,7 @@ class Settings:
             )
         raise ValueError(f"Unknown source {self.source!r}; expected 'local' or 'sftp'")
 
-    def build_sinks(self) -> list[Sink]:
+    def build_sinks(self, required: bool = True) -> list[Sink]:
         sinks: list[Sink] = []
         if self.jsonl_path:
             sinks.append(JsonlSink(self.jsonl_path))
@@ -74,6 +76,6 @@ class Settings:
             sinks.append(CsvSink(self.csv_dir))
         if self.webhook_url:
             sinks.append(WebhookSink(self.webhook_url, self.webhook_token))
-        if not sinks:
+        if required and not sinks:
             raise ValueError("Configure at least one sink: COMMONAPP_JSONL_PATH, COMMONAPP_CSV_DIR or COMMONAPP_WEBHOOK_URL")
         return sinks

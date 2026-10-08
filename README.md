@@ -1,24 +1,84 @@
 # commonapp-connector
 
-Pulls Common App applicant data exports into your own systems: fetch export
-files (from a local folder or an SFTP drop such as Common App's SDS delivery),
-normalize each row into an `Application` record, and deliver it to JSONL,
-CSV, or an HTTP webhook (your CRM/SIS ingest endpoint).
+A Claude connector (MCP server) for Common App applicant data. It loads your
+institution's Common App export files (from a local folder or an SFTP drop such
+as Common App's SDS delivery) into a local database and lets Claude search and
+summarize them:
 
-```
-source (local | sftp)  ->  ExportParser (field map)  ->  sinks (jsonl | csv | webhook)
-                                  ^
-                     StateStore: skip files already ingested
-```
+> *"How many Early Decision applicants do we have for Fall 2027, by intended major?"*
+> *"Pull up Ada Lovelace's application."* · *"Load any new export files."*
 
-## Install
+| Tool | What it does |
+| --- | --- |
+| `search_applicants` | Search by name / email / Common App ID, filter by term, plan, major, state, school; paginated |
+| `get_applicant` | Full record(s) for one Common App ID, including every unmapped export column |
+| `application_counts` | Counts grouped by term, decision plan, major, state, country, school, fee status, or file |
+| `list_export_files` | Which export files are loaded and how many applications each holds |
+| `sync_exports` | Fetch new/changed export files from the configured source and load them |
+
+All tools but `sync_exports` are marked read-only. Nothing is ever written back to Common App.
+
+## Connect it to Claude
+
+Install (Python 3.10+):
 
 ```bash
-pip install -e .            # core
-pip install -e '.[sftp]'    # + SFTP support (paramiko)
+pip install -e '.[sftp]'      # drop [sftp] if you only read a local folder
 ```
 
-## Use
+Configure with environment variables (full list in `.env.example`); at minimum
+a source, e.g. `COMMONAPP_SOURCE=local COMMONAPP_LOCAL_DIR=/path/to/exports`.
+
+**Claude Desktop** — add to `claude_desktop_config.json`, then restart:
+
+```json
+{
+  "mcpServers": {
+    "commonapp": {
+      "command": "/path/to/.venv/bin/commonapp-mcp",
+      "env": {
+        "COMMONAPP_SOURCE": "sftp",
+        "COMMONAPP_SFTP_HOST": "sftp.example.org",
+        "COMMONAPP_SFTP_USER": "youruser",
+        "COMMONAPP_SFTP_KEY_PATH": "/Users/you/.ssh/commonapp",
+        "COMMONAPP_DB_PATH": "/Users/you/commonapp/applications.db",
+        "COMMONAPP_STATE_PATH": "/Users/you/commonapp/state.json"
+      }
+    }
+  }
+}
+```
+
+**Claude Code**:
+
+```bash
+claude mcp add commonapp -e COMMONAPP_LOCAL_DIR=/path/to/exports -- /path/to/.venv/bin/commonapp-mcp
+```
+
+**Remote (shared server)** — serve over streamable HTTP behind a bearer token:
+
+```bash
+COMMONAPP_MCP_TOKEN=$(openssl rand -hex 32) commonapp-mcp --transport http --host 0.0.0.0 --port 8000
+# endpoint: https://<your-host>/mcp  (put it behind TLS, e.g. a reverse proxy)
+claude mcp add --transport http commonapp https://<your-host>/mcp --header "Authorization: Bearer $TOKEN"
+```
+
+The server refuses to bind to a non-localhost address without a token. The
+static token works for Claude Code and the Claude API's MCP connector
+(`authorization_token`). Adding it as a custom connector on claude.ai requires
+OAuth, which this server doesn't implement yet.
+
+### Data protection
+
+Applicant records are FERPA-protected. The local stdio setup keeps all data on
+the machine running Claude Desktop/Code; data only leaves it as tool results
+in your Claude conversation. Keep `.env`, the database, and state files out of
+version control (they're in `.gitignore`), and restrict who holds the token for
+a remote deployment.
+
+## Batch CLI (no Claude)
+
+The same pipeline runs standalone, for scheduled loads into other systems:
 
 ```bash
 # Inspect one export file
@@ -69,5 +129,6 @@ out of version control (they're in `.gitignore`).
 ## Tests
 
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests
+pip install -e '.[sftp]'
+python -m unittest discover -s tests
 ```
