@@ -1,25 +1,27 @@
 """MCP server exposing Common App applicant data to Claude.
 
 Run locally over stdio (Claude Desktop / Claude Code) or over streamable HTTP
-for remote use. Data is read from a local SQLite store that ``sync_exports``
+with OAuth sign-in for remote use (claude.ai custom connectors). Data is read from a local SQLite store that ``sync_exports``
 fills from the configured export source.
 """
 
 from __future__ import annotations
 
 import argparse
-import hmac
 import logging
 import os
 import threading
 from typing import Annotated, Any, Literal
+from urllib.parse import urlparse
 
 from pydantic import Field
 
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
+from .auth import CALLBACK_PATH, OAuthSettings, OIDCAuthProvider
 from .config import Settings
 from .mapping import load_field_map
 from .parser import ExportParser
@@ -28,6 +30,7 @@ from .store import ApplicationStore, SqliteSink
 from .sync import SyncRunner
 
 log = logging.getLogger(__name__)
+audit = logging.getLogger("commonapp_connector.audit")
 
 INSTRUCTIONS = """\
 Access to Common App applicant records ingested from this institution's export files.
@@ -44,11 +47,26 @@ GroupField = Literal["term", "decision_plan", "intended_major", "state", "countr
                      "high_school_name", "fee_status", "source_file"]
 
 
-def create_server(settings: Settings | None = None) -> MCPServer:
+def _audit(tool: str, **args: Any) -> None:
+    """Record who looked at what (FERPA requires knowing who accessed records)."""
+    token = get_access_token()
+    who = token.subject if token and token.subject else "local"
+    audit.info("%s called %s %s", who, tool, {k: v for k, v in args.items() if v not in ("", None)})
+
+
+def create_server(settings: Settings | None = None, oauth: OAuthSettings | None = None,
+                  provider: OIDCAuthProvider | None = None) -> MCPServer:
+    """Build the server. With ``oauth``, HTTP requests need a token from OAuth sign-in."""
     settings = settings or Settings.from_env()
     store = ApplicationStore(settings.db_path)
     sync_lock = threading.Lock()
-    mcp = MCPServer("Common App", instructions=INSTRUCTIONS, version="0.1.0")
+    if oauth:
+        provider = provider or OIDCAuthProvider(oauth)
+        mcp = MCPServer("Common App", instructions=INSTRUCTIONS, version="0.1.0",
+                        auth=oauth.auth_settings(), auth_server_provider=provider)
+        mcp.custom_route(CALLBACK_PATH, methods=["GET"])(provider.handle_callback)
+    else:
+        mcp = MCPServer("Common App", instructions=INSTRUCTIONS, version="0.1.0")
 
     @mcp.tool(annotations=READ_ONLY)
     def search_applicants(
@@ -65,6 +83,7 @@ def create_server(settings: Settings | None = None) -> MCPServer:
         Filters are exact, case-insensitive matches; query is a partial match."""
         filters = {"term": term, "decision_plan": decision_plan, "intended_major": intended_major,
                    "state": state, "high_school_name": high_school_name}
+        _audit("search_applicants", query=query, offset=offset, **filters)
         total, rows = store.search(query, filters, limit, offset)
         return {"total": total, "offset": offset, "results": rows,
                 "has_more": offset + len(rows) < total}
@@ -75,6 +94,7 @@ def create_server(settings: Settings | None = None) -> MCPServer:
     ) -> dict[str, Any]:
         """Full record(s) for one applicant, including unmapped export columns under 'extra'.
         An applicant can have one application per entry term."""
+        _audit("get_applicant", common_app_id=common_app_id)
         apps = store.get(common_app_id.strip())
         if not apps:
             raise ToolError(f"No applicant with Common App ID {common_app_id!r}")
@@ -93,6 +113,7 @@ def create_server(settings: Settings | None = None) -> MCPServer:
         by decision plan for Fall 2027, or top intended majors."""
         filters = {"term": term, "decision_plan": decision_plan,
                    "intended_major": intended_major, "state": state}
+        _audit("application_counts", group_by=group_by, **filters)
         groups = store.counts(group_by, {k: v for k, v in filters.items() if k != group_by}, limit)
         return {"group_by": group_by, "groups": groups, "total": sum(g["count"] for g in groups)}
 
@@ -106,6 +127,7 @@ def create_server(settings: Settings | None = None) -> MCPServer:
     def sync_exports() -> dict[str, Any]:
         """Fetch new or changed export files from the configured source (local folder or
         SFTP) and load them. Files already loaded are skipped."""
+        _audit("sync_exports")
         if not sync_lock.acquire(blocking=False):
             raise ToolError("A sync is already running; try again shortly.")
         try:
@@ -130,25 +152,6 @@ def create_server(settings: Settings | None = None) -> MCPServer:
     return mcp
 
 
-class BearerAuthMiddleware:
-    """Rejects HTTP requests without ``Authorization: Bearer <token>``."""
-
-    def __init__(self, app, token: str):
-        self.app = app
-        self.expected = f"Bearer {token}".encode()
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
-            got = dict(scope["headers"]).get(b"authorization", b"")
-            if not hmac.compare_digest(got, self.expected):
-                await send({"type": "http.response.start", "status": 401,
-                            "headers": [(b"content-type", b"text/plain"),
-                                        (b"www-authenticate", b"Bearer")]})
-                await send({"type": "http.response.body", "body": b"Unauthorized"})
-                return
-        await self.app(scope, receive, send)
-
-
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="commonapp-mcp", description="Common App MCP connector")
     ap.add_argument("--transport", choices=["stdio", "http"], default="stdio")
@@ -158,26 +161,31 @@ def main(argv: list[str] | None = None) -> None:
     # stdout is the protocol channel under stdio, so logs go to stderr.
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    mcp = create_server()
     if args.transport == "stdio":
-        mcp.run("stdio")
+        create_server().run("stdio")
         return
 
     import uvicorn
     from mcp.server.transport_security import TransportSecuritySettings
 
-    token = os.environ.get("COMMONAPP_MCP_TOKEN")
-    if not token and args.host not in ("127.0.0.1", "localhost"):
-        raise SystemExit("Refusing to serve applicant data on a public interface without "
-                         "COMMONAPP_MCP_TOKEN set.")
-    # Host-header checks guard local servers against DNS rebinding; behind a
-    # token on a public host, the reverse proxy decides which hosts reach us.
-    security = (TransportSecuritySettings(enable_dns_rebinding_protection=False) if token else None)
+    oauth = OAuthSettings.from_env(os.environ)
+    local_only = args.host in ("127.0.0.1", "localhost")
+    if oauth is None and not local_only:
+        raise SystemExit("Refusing to serve applicant data on a public interface without OAuth "
+                         "sign-in. Set COMMONAPP_OIDC_ISSUER and friends (see README).")
+    if oauth is None:
+        log.warning("OAuth is not configured: HTTP server is open to anyone on this machine.")
+        security = None  # SDK default: localhost-only host checks
+    else:
+        public = urlparse(oauth.public_url)
+        security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[public.netloc, "127.0.0.1:*", "localhost:*"],
+            allowed_origins=[f"{public.scheme}://{public.netloc}", "https://claude.ai", "https://claude.com"],
+        )
+    mcp = create_server(oauth=oauth)
     app = mcp.streamable_http_app(stateless_http=True, transport_security=security, host=args.host)
-    if token:
-        app = BearerAuthMiddleware(app, token)
     uvicorn.run(app, host=args.host, port=args.port)
-
 
 if __name__ == "__main__":
     main()

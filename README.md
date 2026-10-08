@@ -16,6 +16,8 @@ summarize them:
 | `list_export_files` | Which export files are loaded and how many applications each holds |
 | `sync_exports` | Fetch new/changed export files from the configured source and load them |
 
+Every tool call is written to the `commonapp_connector.audit` log with the signed-in user's email.
+
 All tools but `sync_exports` are marked read-only. Nothing is ever written back to Common App.
 
 ## Connect it to Claude
@@ -55,18 +57,7 @@ a source, e.g. `COMMONAPP_SOURCE=local COMMONAPP_LOCAL_DIR=/path/to/exports`.
 claude mcp add commonapp -e COMMONAPP_LOCAL_DIR=/path/to/exports -- /path/to/.venv/bin/commonapp-mcp
 ```
 
-**Remote (shared server)** — serve over streamable HTTP behind a bearer token:
-
-```bash
-COMMONAPP_MCP_TOKEN=$(openssl rand -hex 32) commonapp-mcp --transport http --host 0.0.0.0 --port 8000
-# endpoint: https://<your-host>/mcp  (put it behind TLS, e.g. a reverse proxy)
-claude mcp add --transport http commonapp https://<your-host>/mcp --header "Authorization: Bearer $TOKEN"
-```
-
-The server refuses to bind to a non-localhost address without a token. The
-static token works for Claude Code and the Claude API's MCP connector
-(`authorization_token`). Adding it as a custom connector on claude.ai requires
-OAuth, which this server doesn't implement yet.
+**claude.ai (custom connector, OAuth sign-in)** — see [Remote setup with OAuth](#remote-setup-with-oauth) below.
 
 ### Data protection
 
@@ -75,6 +66,60 @@ the machine running Claude Desktop/Code; data only leaves it as tool results
 in your Claude conversation. Keep `.env`, the database, and state files out of
 version control (they're in `.gitignore`), and restrict who holds the token for
 a remote deployment.
+
+## Remote setup with OAuth
+
+Deployed on a server, the connector uses OAuth so each person signs in with
+their institution account. Claude registers itself automatically (dynamic
+client registration); the sign-in itself happens at your identity provider,
+and only allowlisted emails or domains get access:
+
+```
+Claude ── /authorize ──▶ connector ── redirect ──▶ your IdP login (Google / Entra / Okta …)
+Claude ◀── code ─────── /oauth/callback ◀── code ── your IdP
+```
+
+1. **Create an OAuth app at your identity provider** (a "Web application"
+   OIDC client) with redirect URI `https://<your-host>/oauth/callback` and
+   scopes `openid email profile`. Note its client ID, client secret, and issuer:
+
+   | Provider | `COMMONAPP_OIDC_ISSUER` |
+   | --- | --- |
+   | Google Workspace | `https://accounts.google.com` |
+   | Microsoft Entra ID | `https://login.microsoftonline.com/<tenant-id>/v2.0` (use your tenant, not `common`) |
+   | Okta | `https://<org>.okta.com` (or your custom authorization server URL) |
+
+2. **Run the connector** behind HTTPS (e.g. a reverse proxy forwarding to port 8000):
+
+   ```bash
+   export COMMONAPP_PUBLIC_URL=https://commonapp.example.edu
+   export COMMONAPP_OIDC_ISSUER=https://accounts.google.com
+   export COMMONAPP_OIDC_CLIENT_ID=... COMMONAPP_OIDC_CLIENT_SECRET=...
+   export COMMONAPP_ALLOWED_DOMAINS=example.edu            # and/or
+   export COMMONAPP_ALLOWED_EMAILS=dean@example.edu,reader@example.edu
+   commonapp-mcp --transport http --host 0.0.0.0 --port 8000
+   ```
+
+3. **Add it in Claude**: claude.ai → Settings → Connectors → *Add custom
+   connector* → URL `https://commonapp.example.edu/mcp`. Claude sends you to your
+   institution's login; after signing in, the tools appear. From Claude Code:
+   `claude mcp add --transport http commonapp https://commonapp.example.edu/mcp`,
+   then `/mcp` to sign in.
+
+Security details:
+
+- The server refuses to listen on a non-localhost address unless OAuth is
+  configured, and refuses to start without an email/domain allowlist or with a
+  non-HTTPS public URL.
+- Sign-in requires the IdP to report an email that isn't marked unverified.
+  Entra ID doesn't verify the `email` claim, so with Entra use your
+  tenant-specific issuer (as above) so only your tenant's accounts can sign in.
+- PKCE is used on both legs. Access tokens last 1 hour; refresh tokens 30 days
+  and rotate on every use (the old pair stops working). Tokens and codes are
+  stored only as SHA-256 hashes in `COMMONAPP_AUTH_DB_PATH`.
+- Clients may only register redirect URIs on `claude.ai`, `claude.com`, or
+  localhost (`COMMONAPP_ALLOWED_REDIRECT_HOSTS` to change), so a stranger can't
+  register a client that sends a staff member's token to their own site.
 
 ## Batch CLI (no Claude)
 
