@@ -1,0 +1,5 @@
+{
+  "applicant.common_app_id": ["CommonApp ID", "Applicant CAS ID"],
+  "term": ["Entry Term Code"],
+  "decision_plan": ["Admit Plan"]
+}

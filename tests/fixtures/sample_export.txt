@@ -1,0 +1,6 @@
+Common App ID	First/Given Name	Last/Family/Surname	Email Address	Date of Birth	CEEB	Entry Term	Decision Plan	Intended Major	Submitted Date	Favorite Color
+12345678	Ada	Lovelace	ada@example.com	12/10/2008	123456	Fall 2027	Early Decision	Mathematics	11/01/2026	blue
+23456789	Alan	Turing	alan@example.com	2008-06-23	654321	Fall 2027	Regular Decision	Computer Science	12/15/2026	
+		NoId								
+34567890	Grace	Hopper	grace@example.com	not-a-date	111111	Fall 2027	Regular Decision	Physics	12/20/2026	
+12345678	Ada	Lovelace	ada.new@example.com	12/10/2008	123456	Fall 2027	Early Decision	Mathematics	11/02/2026	blue
